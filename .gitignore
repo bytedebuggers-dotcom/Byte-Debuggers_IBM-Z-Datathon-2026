@@ -1,0 +1,32 @@
+# Secrets - never push these
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.pkl
+*.joblib
+
+# Data that is too big or private
+data/raw/
+data/processed/*.csv
+*.shp
+*.geojson
+
+# System files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+.env
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.log
+data/raw/*.graphml
+.DS_Store
