@@ -1,8 +1,6 @@
-
 import pandas as pd
 import logging
 import os
-
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -18,19 +16,16 @@ def clean_usgs_data(file_path):
     initial_count = len(df)
     logging.info(f"Starting audit on {initial_count} rows from USGS.")
 
-
     required_columns = ['magnitude', 'depth', 'latitude', 'longitude', 'time']
     for col in required_columns:
         if col not in df.columns:
             raise ValueError(f"Critical column missing from dataset: {col}")
 
-   
     valid_mask = (
         df['magnitude'].notnull() & (df['magnitude'] >= 0) &
         df['depth'].notnull() & (df['depth'] >= 0) &
         df['latitude'].notnull() & (df['longitude'].notnull())
     )
-
 
     df_valid = df[valid_mask].copy()
     df_rejected = df[~valid_mask].copy()
@@ -43,7 +38,6 @@ def clean_usgs_data(file_path):
 
     df_valid['time'] = pd.to_datetime(df_valid['time'])
     
-
     df_valid['Year'] = df_valid['time'].dt.year
     df_valid['Month'] = df_valid['time'].dt.month
 
