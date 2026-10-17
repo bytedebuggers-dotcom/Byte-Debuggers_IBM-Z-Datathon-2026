@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Secrets - never push these
 .env
 *.key
@@ -23,6 +24,8 @@ Thumbs.db
 
 # VS Code
 .vscode/
+=======
+>>>>>>> 045eba8ea57f6ac2a5e2c10ecb68650901b0b81c
 .env
 .venv/
 __pycache__/
@@ -30,3 +33,8 @@ __pycache__/
 *.log
 data/raw/*.graphml
 .DS_Store
+<<<<<<< HEAD
+=======
+logs/
+models/model.joblib
+>>>>>>> 045eba8ea57f6ac2a5e2c10ecb68650901b0b81c
