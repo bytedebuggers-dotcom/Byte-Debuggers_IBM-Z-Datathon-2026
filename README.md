@@ -39,3 +39,19 @@ Pydantic, Streamlit, Folium/PyDeck, Docker
 `ml/` models and notebooks, `backend/` FastAPI service, `dashboard/`
 Streamlit app, `models/` saved model files, `data/` data notes,
 `docs/` documentation.
+
+## Machine learning (ml/)
+
+- `train_hazard_models.py` trains the pipe-burst and gas-leak models on
+  **synthetic** data and saves them to `models/` (`.json` model,
+  `.meta.json` features and threshold, `.pkl` backup).
+- `predict.py` is the only file the backend needs:
+```python
+  from ml.predict import predict
+  predict("pipe_burst", {"pga": 0.4, "magnitude": 6.8, "pipe_age_yrs": 70,
+                         "pressure_psi": 75, "dist_to_fault_km": 3})
+```
+  It returns probability, flagged, risk_tier (high/medium/low), threshold and
+  model_version. Invalid inputs raise a Pydantic `ValidationError`.
+- Models are decision support trained on simulated data, not predictions
+  of record.
