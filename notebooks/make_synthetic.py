@@ -7,19 +7,27 @@ def sigmoid(z):
     return 1 / (1 + np.exp(-z))
 
 rows = []
-for event_id in range(200):                      # Part A: 200 simulated earthquakes
+K = 0.02  # Material correction factor based on FEMA Hazus / ALA guidelines for continuous/welded steel pipes
+
+for event_id in range(200):                      # 200 simulated earthquakes
     mag = rng.uniform(4.5, 7.5)
-    for seg in range(100):                       # Part A: 100 map cells / segments each
+    for seg in range(100):                       # 100 map cells / segments each
         dist_km = rng.uniform(1, 80)
         shaking = max(0.0, mag * 1.5 - 1.2 * np.log1p(dist_km) + rng.normal(0, 0.4))
+        
+        # Part B additions: Peak Ground Velocity (cm/s) and segment length (km)
+        pgv_cm_s = shaking * 12.5
+        length_km = rng.uniform(0.5, 3.0)
+        
         pipe_age = int(rng.integers(5, 60))
         sensor_var = rng.uniform(0, 1)
         gas_main_dist_m = rng.uniform(5, 500)   # distance to nearest gas main
         elevation_m = rng.uniform(0, 60)        # low ground floods first
         building_age = int(rng.integers(5, 100))
 
-        # RULE 1: pipe burst depends on shaking and pipe age
-        p_burst = sigmoid(shaking - 4.5 + 0.03 * pipe_age + sensor_var - 1.5)
+        # Part B: FEMA Hazus / ALA pipeline repair-rate formula
+        repair_rate = K * pgv_cm_s + 0.005 * pipe_age + 0.02 * sensor_var
+        p_burst = 1 - np.exp(-repair_rate * length_km)
         burst = int(rng.random() < p_burst)
 
         # RULE 2: fire needs shaking plus a nearby gas main (more likely if the pipe burst)
@@ -35,12 +43,14 @@ for event_id in range(200):                      # Part A: 200 simulated earthqu
         damage = float(np.clip(0.10 * shaking + 0.004 * building_age
                                + rng.normal(0, 0.05), 0, 1))
 
-        rows.append(dict(event_id=event_id, segment_id=seg, magnitude=mag,
-                         dist_km=dist_km, shaking=shaking, pipe_age=pipe_age,
-                         sensor_var=sensor_var, gas_main_dist_m=gas_main_dist_m,
-                         elevation_m=elevation_m, building_age=building_age,
-                         burst_48h=burst, fire_48h=fire, flood_48h=flood,
-                         damage_score=damage, is_synthetic=True))
+        rows.append(dict(
+            event_id=event_id, segment_id=seg, magnitude=mag,
+            dist_km=dist_km, shaking=shaking, pgv_cm_s=pgv_cm_s,
+            length_km=length_km, pipe_age=pipe_age, sensor_var=sensor_var,
+            gas_main_dist_m=gas_main_dist_m, elevation_m=elevation_m,
+            building_age=building_age, burst_48h=burst, fire_48h=fire,
+            flood_48h=flood, damage_score=damage, is_synthetic=True
+        ))
 
 df = pd.DataFrame(rows)
 df.to_csv("data/processed/features.csv", index=False)
