@@ -2,12 +2,16 @@
 Routing tests. Run from the repo root:   python -m pytest api/test_routing.py -v
 They use the SYNTHETIC grid from build_demo_graph(), so no map data is needed.
 """
+import networkx as nx
+
 try:
-    from api.routing import (build_demo_graph, nearest_node, nodes_in_radius,
-                             safe_route_emergency, safe_route_evacuation)
+    from api.routing import (build_demo_graph, evacuation_route, nearest_node, nodes_in_radius,
+                             nodes_in_zones, nodes_to_lonlat, safe_route, safe_route_emergency,
+                             safe_route_evacuation)
 except ImportError:  # run directly from inside api/
-    from routing import (build_demo_graph, nearest_node, nodes_in_radius,
-                         safe_route_emergency, safe_route_evacuation)
+    from routing import (build_demo_graph, evacuation_route, nearest_node, nodes_in_radius,
+                         nodes_in_zones, nodes_to_lonlat, safe_route, safe_route_emergency,
+                         safe_route_evacuation)
 
 G = build_demo_graph()  # 7x7 grid, node id = row*7 + col
 START = (18.42, -33.92)   # node 0   (top-left)
@@ -91,3 +95,81 @@ def test_evacuation_no_safe_assembly_point():
     ring = set(G.predecessors(nearest_node(G, *origin)))  # wall in the origin
     res = safe_route_evacuation(origin, [target], hazard_nodes=ring, G=G)
     assert res["status"] == "no_route" and res["assembly_index"] is None
+
+
+# ---- the three functions in docs/api_contract.md, on a raw OSM-style MultiDiGraph ----------
+def fake_osm_grid(n=10):
+    """Like what ox.load_graphml returns: a MultiDiGraph with x, y and length attributes."""
+    M = nx.MultiDiGraph()
+    for i in range(n):
+        for j in range(n):
+            M.add_node(i * n + j, x=18.40 + i * 0.01, y=-33.90 - j * 0.01)
+    for i in range(n):
+        for j in range(n):
+            for di, dj in ((1, 0), (0, 1)):
+                if i + di < n and j + dj < n:
+                    a, b = i * n + j, (i + di) * n + (j + dj)
+                    M.add_edge(a, b, length=1000)
+                    M.add_edge(b, a, length=1000)
+                    M.add_edge(a, b, length=1500)  # a parallel, longer edge
+    return M
+
+
+M = fake_osm_grid()
+M_START, M_END = (18.40, -33.90), (18.49, -33.99)
+
+
+def test_contract_safe_route_detours_around_blocked_node():
+    normal = safe_route(M, M_START, M_END, [])
+    blocked = normal[len(normal) // 2: len(normal) // 2 + 1]
+    detour = safe_route(M, M_START, M_END, blocked)
+    assert detour and detour != normal and blocked[0] not in detour
+
+
+def test_contract_safe_route_reaches_an_incident_inside_a_hazard_zone():
+    zone = [{"lon": 18.49, "lat": -33.99, "radius_m": 500, "hazard": "fire"}]  # covers only the incident node
+    blocked = nodes_in_zones(M, zone)
+    dest = nearest_node(M, *M_END)
+    assert dest in blocked
+    route = safe_route(M, M_START, M_END, blocked)
+    assert route and route[-1] == dest          # the incident itself is still reachable
+    # a wider zone that walls the incident in cannot be crossed: no safe route
+    walled = nodes_in_zones(M, [{"lon": 18.49, "lat": -33.99, "radius_m": 2500, "hazard": "fire"}])
+    assert safe_route(M, M_START, M_END, walled) is None
+
+
+def test_contract_safe_route_returns_none_when_cut_off():
+    dest = nearest_node(M, *M_END)
+    wall = set(M.predecessors(dest))
+    assert safe_route(M, M_START, M_END, wall) is None
+
+
+def test_contract_evacuation_avoids_zone_and_names_the_assembly_point():
+    zone_nodes = nodes_in_zones(M, [{"lon": 18.45, "lat": -33.95, "radius_m": 2500, "hazard": "fire"}])
+    aps = [{"name": "Assembly A", "lon": 18.49, "lat": -33.99},
+           {"name": "Assembly B", "lon": 18.40, "lat": -33.99}]
+    name, path = evacuation_route(M, (18.41, -33.91), aps, zone_nodes)
+    assert name in ("Assembly A", "Assembly B") and path and not (set(path) & zone_nodes)
+
+
+def test_contract_evacuation_skips_blocked_assembly_point_and_handles_none():
+    aps = [{"name": "Near", "lon": 18.42, "lat": -33.91}, {"name": "Far", "lon": 18.49, "lat": -33.99}]
+    near_node = nearest_node(M, 18.42, -33.91)
+    name, path = evacuation_route(M, (18.41, -33.91), aps, {near_node})
+    assert name == "Far" and near_node not in path
+    assert evacuation_route(M, (18.41, -33.91), [aps[0]], {near_node}) == (None, None)
+
+
+def test_contract_evacuation_prefers_leaving_the_risk_zone():
+    origin = (18.45, -33.95)
+    aps = [{"name": "InsideRisk", "lon": 18.46, "lat": -33.95}, {"name": "Outside", "lon": 18.40, "lat": -33.95}]
+    risk = nodes_in_zones(M, [{"lon": 18.45, "lat": -33.95, "radius_m": 1500, "hazard": "flood"}])
+    name, _ = evacuation_route(M, origin, aps, set(), risk_nodes=risk)
+    assert name == "Outside"
+
+
+def test_nodes_to_lonlat_gives_lon_lat_pairs():
+    route = safe_route(M, M_START, M_END, [])
+    pts = nodes_to_lonlat(M, route)
+    assert pts[0] == [18.40, -33.90] and pts[-1] == [18.49, -33.99]
+    assert all(len(p) == 2 and -180 <= p[0] <= 180 and -90 <= p[1] <= 90 for p in pts)

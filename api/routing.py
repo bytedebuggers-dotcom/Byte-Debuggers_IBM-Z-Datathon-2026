@@ -1,7 +1,15 @@
 """
 QuakeFix - Member 3: safe-route logic (NetworkX; OSMnx only used to load the graph if installed).
 
-Two entry points for Member 1's API:
+CONTRACT FUNCTIONS (docs/api_contract.md; what Member 1's API should call), near the bottom:
+    nodes_in_zones(G, zones) -> set of node ids        zones = [{lon, lat, radius_m, hazard}]
+    safe_route(G, origin_lonlat, dest_lonlat, blocked_nodes) -> [node ids] | None
+    evacuation_route(G, origin_lonlat, assembly_points, blocked_nodes) -> (name, [node ids]) | (None, None)
+    nodes_to_lonlat(G, nodes) -> [[lon, lat], ...]     for the "path" field the dashboard draws
+    load_graph(path)                                   loads data/raw/road_graph.graphml
+Run `python api/routing.py` for a self-test (prints ALL ROUTING TESTS PASSED).
+
+Richer variants that return a dict with status/message/coords (optional to use):
 
     safe_route_emergency(origin_lonlat, dest_lonlat, hazard_nodes=(), G=None)
         Fastest path for an ambulance / fire engine from a station to an incident,
@@ -211,11 +219,118 @@ def safe_route_evacuation(origin_lonlat: Sequence[float], assembly_points: Seque
     return out
 
 
-if __name__ == "__main__":  # quick demo on the synthetic grid
-    g = build_demo_graph()
-    normal = safe_route_emergency((18.42, -33.92), (18.45, -33.89), [], G=g)
-    blocked = set(normal["route_nodes"][len(normal["route_nodes"]) // 2:][:1])
-    detour = safe_route_emergency((18.42, -33.92), (18.45, -33.89), blocked, G=g)
-    print("normal :", normal["route_nodes"], round(normal["length_m"]), "m")
-    print("blocked:", blocked)
-    print("detour :", detour["route_nodes"], round(detour["length_m"]), "m")
+# --------------------------------------------------------------------------- API contract functions
+# These three are what docs/api_contract.md promises Member 1 ("api/routing.py provides:
+# nodes_in_zones, safe_route, evacuation_route"). They accept either a raw OSMnx MultiDiGraph or
+# a graph from get_graph()/build_demo_graph(). Path points for the dashboard are [lon, lat]:
+# use nodes_to_lonlat(G, route_nodes).
+_SIMPLE_CACHE: dict = {}
+
+
+def _simple(G):
+    """Return a simple DiGraph view of G (collapsing parallel edges once, then cached)."""
+    if not G.is_multigraph():
+        return G
+    hit = _SIMPLE_CACHE.get(id(G))
+    if hit is None or hit[0] is not G:
+        hit = (G, _simplify(G))
+        _SIMPLE_CACHE[id(G)] = hit
+    return hit[1]
+
+
+def load_graph(path: str = DEFAULT_GRAPH_PATH):
+    """Load data/raw/road_graph.graphml (cached). Same as get_graph()."""
+    return get_graph(str(path))
+
+
+def nodes_in_zones(G, zones) -> set:
+    """zones: list of dicts {lon, lat, radius_m, hazard}. Returns ids of road nodes inside any zone."""
+    blocked: set = set()
+    for z in zones:
+        blocked |= nodes_in_radius(G, z["lon"], z["lat"], z["radius_m"])
+    return blocked
+
+
+def nodes_to_lonlat(G, nodes) -> list:
+    """Node ids -> [[lon, lat], ...] for the API's route "path" field."""
+    return [[float(G.nodes[n]["x"]), float(G.nodes[n]["y"])] for n in nodes]
+
+
+def safe_route(G, origin_lonlat, dest_lonlat, blocked_nodes):
+    """Emergency (ambulance) route avoiding blocked nodes. Returns a list of node ids, or None.
+
+    The start and the incident (destination) are always allowed even if they sit inside a
+    hazard zone, so an ambulance can still be sent TO an incident in a blocked area; every
+    road node in between that is blocked is avoided. None = no safe route: tell the commander.
+    """
+    S = _simple(G)
+    orig = nearest_node(S, *origin_lonlat)
+    dest = nearest_node(S, *dest_lonlat)
+    hazards = {n for n in blocked_nodes if n in S} - {orig, dest}
+    try:
+        return nx.shortest_path(nx.restricted_view(S, hazards, []), orig, dest, weight="length")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
+
+def evacuation_route(G, origin_lonlat, assembly_points, blocked_nodes, risk_nodes=()):
+    """Citizen evacuation: the nearest SAFE assembly point reachable without crossing a hazard.
+
+    assembly_points: list of dicts {name, lon, lat}.  Returns (name, node list) or (None, None).
+    blocked_nodes are impassable. Optional risk_nodes (the wider predicted risk zone) stay
+    passable but cost RISK_PENALTY x more, so routes leave the zone quickly. Assembly points that
+    are blocked or inside the risk zone are skipped. The start may be inside a hazard zone.
+    """
+    S = _simple(G)
+    orig = nearest_node(S, *origin_lonlat)
+    blocked = set(blocked_nodes)
+    hazards = {n for n in blocked if n in S} - {orig}
+    risky = {n for n in risk_nodes if n in S} - hazards
+    candidates: dict = {}
+    for ap in assembly_points:
+        node = nearest_node(S, ap["lon"], ap["lat"])
+        if node in blocked or node in risky:
+            continue  # the assembly point itself is in a hazard / risk zone
+        candidates.setdefault(node, ap["name"])
+
+    def weight(u, v, d):
+        return d["length"] * RISK_PENALTY if (u in risky or v in risky) else d["length"]
+
+    dist, paths = nx.single_source_dijkstra(nx.restricted_view(S, hazards, []), orig, weight=weight)
+    reachable = [n for n in candidates if n in dist]
+    if not reachable:
+        return None, None
+    best = min(reachable, key=lambda n: dist[n])
+    return candidates[best], paths[best]
+
+
+if __name__ == "__main__":
+    # Self-test on a small fake road grid (same checks as the playbook). Run: python api/routing.py
+    G = nx.MultiDiGraph()
+    N = 10
+    for i in range(N):
+        for j in range(N):
+            G.add_node(i * N + j, x=18.40 + i * 0.01, y=-33.90 - j * 0.01)
+    for i in range(N):
+        for j in range(N):
+            for di, dj in [(1, 0), (0, 1)]:
+                a, b = i * N + j, (i + di) * N + (j + dj)
+                if i + di < N and j + dj < N:
+                    G.add_edge(a, b, length=1000)
+                    G.add_edge(b, a, length=1000)
+    start, end = (18.40, -33.90), (18.49, -33.99)
+    normal = safe_route(G, start, end, [])
+    blocked = normal[len(normal) // 2: len(normal) // 2 + 1]
+    detour = safe_route(G, start, end, blocked)
+    print("normal route nodes:", len(normal), "| detour nodes:", len(detour) if detour else None)
+    assert detour and detour != normal and blocked[0] not in detour, "blocked node must change the route"
+
+    fire_zone = [{"lon": 18.45, "lat": -33.95, "radius_m": 2500, "hazard": "fire"}]
+    zone_nodes = nodes_in_zones(G, fire_zone)
+    aps = [{"name": "Assembly A", "lon": 18.49, "lat": -33.99},
+           {"name": "Assembly B", "lon": 18.40, "lat": -33.99}]
+    name, path = evacuation_route(G, (18.41, -33.91), aps, zone_nodes)
+    print("zone nodes:", len(zone_nodes), "| evacuate to:", name, "| nodes:", len(path) if path else None)
+    assert path and not (set(path) & zone_nodes), "evacuation route must avoid the fire zone"
+    print("path points for the dashboard:", nodes_to_lonlat(G, detour)[:2], "...")
+    print("ALL ROUTING TESTS PASSED")
