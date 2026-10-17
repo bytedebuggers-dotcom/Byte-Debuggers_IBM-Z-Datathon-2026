@@ -218,3 +218,31 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== QuakeFix safety rules =====
+
+# Secrets and keys: NEVER commit
+*.pem
+*.key
+*.ppk
+id_rsa
+id_ed25519
+.env
+.env.*
+!.env.example
+secrets/
+
+# Big or raw data stays out (rebuild it with ml/get_data.py)
+data/raw/
+data/*.csv
+data/*.parquet
+data/*.graphml
+*.graphml
+
+# Notebook clutter
+.ipynb_checkpoints/
+
+# DO commit our trained models (keep these lines last)
+!models/
+!models/*.pkl
+!models/*.json
