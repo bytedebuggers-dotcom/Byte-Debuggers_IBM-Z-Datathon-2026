@@ -97,6 +97,12 @@ os.makedirs("logs", exist_ok=True)
 MODEL_PATH = os.getenv("MODEL_PATH", "models/model.joblib")
 try:
     ART = joblib.load(MODEL_PATH)
+    for h in ["burst", "fire", "flood"]:
+        if h in ART and "pipeline" in ART[h]:
+            for _, step in ART[h]["pipeline"].steps:
+                if type(step).__name__ == "LogisticRegression":
+                    if not hasattr(step, "multi_class"):
+                        step.multi_class = "auto"
 except Exception:
     ART = None
  
