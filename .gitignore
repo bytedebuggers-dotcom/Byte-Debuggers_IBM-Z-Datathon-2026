@@ -246,3 +246,7 @@ data/*.graphml
 !models/
 !models/*.pkl
 !models/*.json
+# generated files
+.idea/
+logs/
+data/processed/

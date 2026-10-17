@@ -1,15 +1,19 @@
 """QuakeFix - train hazard models (pipe burst + gas leak) on SYNTHETIC data.
 
 Run from the repo:  python ml/train_hazard_models.py
-Saves to models/:   <target>_v1.pkl (model + features + threshold) and <target>_v1.json
+Saves to models/:   <target>_v1.json       (portable XGBoost model)
+                    <target>_v1.meta.json  (features, threshold, version - read by ml/predict.py)
+                    <target>_v1.pkl        (backup bundle)
 """
+import json
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (average_precision_score, classification_report,
-                             confusion_matrix, precision_recall_curve)
+                             confusion_matrix, precision_recall_curve,
+                             precision_score, recall_score)
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
@@ -103,6 +107,14 @@ def train_target(df, target):
                  "note": "trained on synthetic data"},
                 MODELS_DIR / f"{target}_{VERSION}.pkl")
     model.save_model(MODELS_DIR / f"{target}_{VERSION}.json")   # portable copy
+
+    # Small JSON file the backend reads: no pickle needed on the server
+    meta = {"target": target, "version": VERSION, "features": feats,
+            "threshold": threshold, "trained_on": "synthetic data",
+            "test_recall": round(float(recall_score(y_test, pred)), 3),
+            "test_precision": round(float(precision_score(y_test, pred)), 3),
+            "test_pr_auc": round(float(pr_auc), 3)}
+    (MODELS_DIR / f"{target}_{VERSION}.meta.json").write_text(json.dumps(meta, indent=2))
     return model
 
 
