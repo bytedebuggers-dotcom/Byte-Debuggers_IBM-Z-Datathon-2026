@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Secrets - never push these
 .env
 *.key
@@ -9,32 +8,25 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.ipynb_checkpoints/
+*.log
+logs/
+
+# Model files: ignore pickles in general, but ship the one the API loads
 *.pkl
 *.joblib
+!models/model.joblib
 
 # Data that is too big or private
 data/raw/
+data/raw/*.graphml
 data/processed/*.csv
+!data/processed/features.csv
 *.shp
 *.geojson
 
-# System files
+# System / editor files
 .DS_Store
 Thumbs.db
-
-# VS Code
 .vscode/
-=======
->>>>>>> 045eba8ea57f6ac2a5e2c10ecb68650901b0b81c
-.env
-.venv/
-__pycache__/
-.ipynb_checkpoints/
-*.log
-data/raw/*.graphml
-.DS_Store
-<<<<<<< HEAD
-=======
-logs/
-models/model.joblib
->>>>>>> 045eba8ea57f6ac2a5e2c10ecb68650901b0b81c
+.idea/

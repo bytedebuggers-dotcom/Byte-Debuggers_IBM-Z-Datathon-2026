@@ -1,0 +1,221 @@
+"""
+QuakeFix - Member 3: safe-route logic (NetworkX; OSMnx only used to load the graph if installed).
+
+Two entry points for Member 1's API:
+
+    safe_route_emergency(origin_lonlat, dest_lonlat, hazard_nodes=(), G=None)
+        Fastest path for an ambulance / fire engine from a station to an incident,
+        never passing through any hazard node (roadblocks, active fires, flood zones).
+
+    safe_route_evacuation(origin_lonlat, assembly_points, hazard_nodes=(), risk_nodes=(), G=None)
+        Path for citizens from where they are to the nearest SAFE assembly point.
+        hazard_nodes are impassable. risk_nodes (e.g. the predicted high-risk zone)
+        stay passable but cost much more, so routes lead AWAY from the impact zone.
+
+Both return a dict (never raise on "no route"):
+    {"status": "ok" | "no_route",
+     "route_nodes": [node ids] | None,     # contract field for directives ("route_nodes")
+     "coords": [[lon, lat], ...] | None,   # ready for a pydeck PathLayer
+     "length_m": float | None,
+     "message": str}                       # plain text for the commander
+
+Helpers:
+    get_graph(path)              load data/raw/road_graph.graphml (cached)
+    build_demo_graph()           small SYNTHETIC grid so tests/demos work with no map data
+    nodes_in_radius(G, lon, lat, radius_m)   turn a fire/flood circle into hazard nodes
+
+Coordinates are always (lon, lat), like OSMnx.
+"""
+from __future__ import annotations
+
+import math
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, Optional, Sequence
+
+import networkx as nx
+import numpy as np
+
+DEFAULT_GRAPH_PATH = os.getenv("QUAKEFIX_GRAPH", "data/raw/road_graph.graphml")
+RISK_PENALTY = 5.0  # a road touching a risk node costs 5x its length in evacuation routing
+
+
+# --------------------------------------------------------------------------- geometry
+def _haversine_m(lon1, lat1, lon2, lat2):
+    """Great-circle distance in metres; works on scalars or numpy arrays."""
+    r = 6371008.8
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = p2 - p1
+    dl = np.radians(lon2) - np.radians(lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 2 * r * np.arcsin(np.sqrt(a))
+
+
+def _node_arrays(G):
+    nodes = list(G.nodes)
+    xs = np.array([float(G.nodes[n]["x"]) for n in nodes])
+    ys = np.array([float(G.nodes[n]["y"]) for n in nodes])
+    return nodes, xs, ys
+
+
+def nearest_node(G, lon: float, lat: float, exclude: Iterable = ()):
+    """Nearest graph node to (lon, lat), skipping any node in `exclude`."""
+    nodes, xs, ys = _node_arrays(G)
+    d = _haversine_m(lon, lat, xs, ys)
+    skip = set(exclude)
+    if skip:
+        mask = np.array([n in skip for n in nodes])
+        if mask.all():
+            return None
+        d = np.where(mask, np.inf, d)
+    return nodes[int(np.argmin(d))]
+
+
+def nodes_in_radius(G, lon: float, lat: float, radius_m: float) -> set:
+    """All nodes within radius_m of a point: use for a fire / flood / collapse zone."""
+    nodes, xs, ys = _node_arrays(G)
+    d = _haversine_m(lon, lat, xs, ys)
+    return {n for n, dist in zip(nodes, d) if dist <= radius_m}
+
+
+# --------------------------------------------------------------------------- graph
+def _simplify(G) -> nx.DiGraph:
+    """Collapse a (Multi)DiGraph to a DiGraph keeping the shortest parallel edge."""
+    S = nx.DiGraph()
+    for n, data in G.nodes(data=True):
+        S.add_node(n, x=float(data["x"]), y=float(data["y"]))
+    for u, v, data in G.edges(data=True):
+        length = float(data.get("length", 0.0))
+        if not S.has_edge(u, v) or length < S[u][v]["length"]:
+            S.add_edge(u, v, length=length)
+    return S
+
+
+@lru_cache(maxsize=2)
+def get_graph(path: str = DEFAULT_GRAPH_PATH) -> nx.DiGraph:
+    """Load the road graph saved by Member 2 (OSMnx GraphML). Cached after first call."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"{p} not found. Ask Member 2 for road_graph.graphml (data/raw is not in Git), "
+            "or use build_demo_graph() for a synthetic test map.")
+    try:
+        import osmnx as ox
+        G = ox.load_graphml(p)
+    except ImportError:  # osmnx missing (e.g. on s390x): parse GraphML directly
+        G = nx.read_graphml(p)
+        G = nx.relabel_nodes(G, {n: int(n) if str(n).lstrip("-").isdigit() else n for n in G.nodes})
+    return _simplify(G)
+
+
+def build_demo_graph(rows: int = 7, cols: int = 7, origin=(18.42, -33.92), step_deg: float = 0.005) -> nx.DiGraph:
+    """SYNTHETIC grid street map (two-way streets) for tests and offline demos. Not real roads."""
+    G = nx.DiGraph(name="synthetic-demo-grid")
+    nid = lambda r, c: r * cols + c
+    for r in range(rows):
+        for c in range(cols):
+            G.add_node(nid(r, c), x=origin[0] + c * step_deg, y=origin[1] + r * step_deg)
+    for r in range(rows):
+        for c in range(cols):
+            for dr, dc in ((0, 1), (1, 0)):
+                r2, c2 = r + dr, c + dc
+                if r2 < rows and c2 < cols:
+                    a, b = nid(r, c), nid(r2, c2)
+                    length = float(_haversine_m(G.nodes[a]["x"], G.nodes[a]["y"], G.nodes[b]["x"], G.nodes[b]["y"]))
+                    G.add_edge(a, b, length=length)
+                    G.add_edge(b, a, length=length)
+    return G
+
+
+# --------------------------------------------------------------------------- routing
+def _result(G, path, length, message) -> dict:
+    if path is None:
+        return {"status": "no_route", "route_nodes": None, "coords": None, "length_m": None, "message": message}
+    return {
+        "status": "ok",
+        "route_nodes": [int(n) if isinstance(n, (int, np.integer)) else n for n in path],
+        "coords": [[float(G.nodes[n]["x"]), float(G.nodes[n]["y"])] for n in path],
+        "length_m": float(length),
+        "message": message,
+    }
+
+
+def safe_route_emergency(origin_lonlat: Sequence[float], dest_lonlat: Sequence[float],
+                         hazard_nodes: Iterable = (), G: Optional[nx.DiGraph] = None) -> dict:
+    """Fastest (shortest) road path that avoids every hazard node."""
+    G = G if G is not None else get_graph()
+    hazards = {n for n in hazard_nodes if n in G}
+    orig = nearest_node(G, origin_lonlat[0], origin_lonlat[1], exclude=hazards)
+    dest = nearest_node(G, dest_lonlat[0], dest_lonlat[1], exclude=hazards)
+    if orig is None or dest is None:
+        return _result(G, None, None, "Every road node is blocked. Dispatch cannot route; use manual command.")
+    H = nx.restricted_view(G, hazards, [])  # same graph without hazard nodes (no copy)
+    try:
+        length, path = nx.single_source_dijkstra(H, orig, dest, weight="length")
+    except nx.NetworkXNoPath:
+        return _result(G, None, None,
+                       f"No safe route: destination is cut off by {len(hazards)} blocked node(s). "
+                       "Commander decision needed (air support, foot team, or clear the road).")
+    return _result(G, path, length, f"Route found avoiding {len(hazards)} blocked node(s).")
+
+
+def safe_route_evacuation(origin_lonlat: Sequence[float], assembly_points: Sequence[Sequence[float]],
+                          hazard_nodes: Iterable = (), risk_nodes: Iterable = (),
+                          G: Optional[nx.DiGraph] = None) -> dict:
+    """Route citizens to the best reachable assembly point.
+
+    hazard_nodes: impassable (fire, flood, collapse, roadblock).
+    risk_nodes:   predicted high-risk zone; passable but RISK_PENALTY x more costly, so the
+                  route leaves the zone quickly and prefers assembly points outside it.
+    Assembly points inside the hazard/risk zone are skipped (not safe). The result has the extra keys
+    "assembly_index" and "assembly_node" saying which point was chosen.
+    """
+    G = G if G is not None else get_graph()
+    hazards = {n for n in hazard_nodes if n in G}
+    risky = {n for n in risk_nodes if n in G} - hazards
+    orig = nearest_node(G, origin_lonlat[0], origin_lonlat[1], exclude=hazards)
+    if orig is None:
+        out = _result(G, None, None, "Every road node is blocked. Cannot plan an evacuation route.")
+        return {**out, "assembly_index": None, "assembly_node": None}
+
+    # candidate assembly nodes: the node nearest each point; a point that sits in the
+    # hazard or risk zone is NOT a safe assembly point, so it is skipped (not re-snapped)
+    candidates = {}
+    for i, (lon, lat) in enumerate(assembly_points):
+        node = nearest_node(G, lon, lat)
+        if node is not None and node not in hazards and node not in risky:
+            candidates.setdefault(node, i)
+
+    H = nx.restricted_view(G, hazards, [])
+
+    def weight(u, v, d):
+        w = d["length"]
+        return w * RISK_PENALTY if (u in risky or v in risky) else w
+
+    dist, paths = nx.single_source_dijkstra(H, orig, weight=weight)
+    reachable = [n for n in candidates if n in dist]
+    if not reachable:
+        out = _result(G, None, None,
+                      "No reachable safe assembly point from this location. Shelter in place or request "
+                      "manual evacuation by the commander.")
+        return {**out, "assembly_index": None, "assembly_node": None}
+    best = min(reachable, key=lambda n: dist[n])
+    path = paths[best]
+    true_len = sum(G[u][v]["length"] for u, v in zip(path[:-1], path[1:]))
+    out = _result(G, path, true_len,
+                  f"Evacuation route to assembly point {candidates[best]} found "
+                  f"(avoiding {len(hazards)} blocked node(s), discouraging {len(risky)} risk-zone node(s)).")
+    out["assembly_index"] = candidates[best]
+    out["assembly_node"] = out["route_nodes"][-1]
+    return out
+
+
+if __name__ == "__main__":  # quick demo on the synthetic grid
+    g = build_demo_graph()
+    normal = safe_route_emergency((18.42, -33.92), (18.45, -33.89), [], G=g)
+    blocked = set(normal["route_nodes"][len(normal["route_nodes"]) // 2:][:1])
+    detour = safe_route_emergency((18.42, -33.92), (18.45, -33.89), blocked, G=g)
+    print("normal :", normal["route_nodes"], round(normal["length_m"]), "m")
+    print("blocked:", blocked)
+    print("detour :", detour["route_nodes"], round(detour["length_m"]), "m")
