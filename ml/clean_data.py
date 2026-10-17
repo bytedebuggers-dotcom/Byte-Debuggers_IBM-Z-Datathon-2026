@@ -39,7 +39,7 @@ def clean_usgs_data(file_path):
     df_valid['Month'] = df_valid['time'].dt.month
 
     print(f"Audit complete. Valid rows: {len(df_valid)}, Logged & Rejected rows: {len(df_rejected)}")
-
+    
     os.makedirs("data/processed", exist_ok=True)
     df_valid.to_csv("data/processed/cleaned_quakes.csv", index=False)
     return df_valid
