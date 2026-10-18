@@ -238,6 +238,18 @@ def _simple(G):
     return hit[1]
 
 
+def _region(S, start, nodes) -> set:
+    """The connected group of `nodes` that contains `start` (roads treated as two-way)."""
+    seen, stack = {start}, [start]
+    while stack:
+        u = stack.pop()
+        for v in list(S.successors(u)) + list(S.predecessors(u)):
+            if v in nodes and v not in seen:
+                seen.add(v)
+                stack.append(v)
+    return seen
+
+
 def load_graph(path: str = DEFAULT_GRAPH_PATH):
     """Load data/raw/road_graph.graphml (cached). Same as get_graph()."""
     return get_graph(str(path))
@@ -279,13 +291,22 @@ def evacuation_route(G, origin_lonlat, assembly_points, blocked_nodes, risk_node
     assembly_points: list of dicts {name, lon, lat}.  Returns (name, node list) or (None, None).
     blocked_nodes are impassable. Optional risk_nodes (the wider predicted risk zone) stay
     passable but cost RISK_PENALTY x more, so routes leave the zone quickly. Assembly points that
-    are blocked or inside the risk zone are skipped. The start may be inside a hazard zone.
+    are blocked or inside the risk zone are skipped. The start may be inside a hazard zone: the
+    route then leaves that zone by the shortest way out (see the comment below).
     """
     S = _simple(G)
     orig = nearest_node(S, *origin_lonlat)
     blocked = set(blocked_nodes)
     hazards = {n for n in blocked if n in S} - {orig}
     risky = {n for n in risk_nodes if n in S} - hazards
+    if orig in blocked:
+        # The start is INSIDE a hazard zone (the usual case for "evacuate District 3"): people
+        # must be able to get OUT. The contiguous blocked area around the start becomes
+        # passable-but-costly (like risk_nodes, so the way out is as short as possible); any
+        # other blocked area stays impassable.
+        here = _region(S, orig, hazards | {orig})
+        hazards -= here
+        risky |= here
     candidates: dict = {}
     for ap in assembly_points:
         node = nearest_node(S, ap["lon"], ap["lat"])

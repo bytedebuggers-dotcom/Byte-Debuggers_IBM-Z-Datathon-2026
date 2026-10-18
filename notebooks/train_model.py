@@ -14,7 +14,9 @@ Design rules
   possible precision. Held-out events are only used to REPORT, never to tune or to pick models.
 * Best classifier = highest out-of-fold precision at the recall target.
   Best damage model = lowest out-of-fold mean absolute error.
-* scikit-learn only, so everything is safe to run on the s390x LinuxONE server.
+* scikit-learn only, so everything is safe to run on the s390x LinuxONE server. A tree model is
+  only chosen over a linear one if it is >= --tree-margin (3%) better, because linear models
+  pickle as plain arrays and load on any CPU / scikit-learn version.
 
 Artifact (models/model.joblib), exactly as in docs/api_contract.md:
     {"features": [8 column names, in order],
@@ -63,6 +65,9 @@ CLASSIFIERS = {
     "flood": ("flood_48h", "Flood"),
 }
 DAMAGE_TARGET = "damage_score"
+# Plain coefficient arrays: these unpickle safely on any CPU (including big-endian s390x) and
+# across scikit-learn versions. Tree models are only chosen if they are clearly better.
+PORTABLE = {"logistic_regression", "ridge"}
 CLF_NAMES = {"logistic_regression": "Logistic Regression", "random_forest": "Random Forest",
              "hist_gradient_boosting": "Hist Gradient Boosting"}
 REG_NAMES = {"ridge": "Ridge regression", "random_forest": "Random Forest",
@@ -158,6 +163,24 @@ def pick_threshold(y_true, proba, min_recall: float) -> float:
     return float(thresholds[ok[np.argmax(precision[ok])]])
 
 
+def choose(results, score, higher_is_better: bool, margin: float):
+    """Pick the best model by score(result). A tree model must beat the best portable (linear)
+    model by `margin` (relative) to be chosen, because tree pickles can fail to load on the
+    big-endian s390x server or under a different scikit-learn version. margin=0 disables this."""
+    sign = 1 if higher_is_better else -1
+    best = max(results, key=lambda r: sign * score(r))
+    portable = [r for r in results if r["kind"] in PORTABLE]
+    if best["kind"] in PORTABLE or not portable:
+        return best
+    best_p = max(portable, key=lambda r: sign * score(r))
+    gain = sign * (score(best) - score(best_p)) / max(abs(score(best_p)), 1e-12)
+    if gain < margin:
+        print(f"  (keeping {best_p['kind']}: {best['kind']} is only {gain:.1%} better, below the "
+              f"{margin:.0%} needed to justify a model that may not load on s390x)")
+        return best_p
+    return best
+
+
 def clf_metrics(y, proba, thr: float) -> dict:
     pred = (proba >= thr).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
@@ -238,6 +261,9 @@ def main():
     ap.add_argument("--data", default="data/processed/features.csv")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--min-recall", type=float, default=0.90)
+    ap.add_argument("--tree-margin", type=float, default=0.03,
+                    help="a tree model must beat the best linear model by this fraction to be chosen "
+                         "(keeps the saved model portable to s390x); 0 = pick purely by score")
     ap.add_argument("--test-size", type=float, default=0.25)
     ap.add_argument("--out", default="models/model.joblib")
     ap.add_argument("--results-md", default="docs/model_results.md")
@@ -271,7 +297,7 @@ def main():
         print(f"  positive_rate={y.mean():.3f}")
         results = [evaluate_classifier(k, X.iloc[tr], y.iloc[tr], g_tr, X.iloc[te], y.iloc[te], args.min_recall)
                    for k in CLF_NAMES]
-        best = max(results, key=lambda r: r["cv"]["precision"])
+        best = choose(results, lambda r: r["cv"]["precision"], True, args.tree_margin)
         print(f"  -> best: {best['kind']} (thr {best['threshold']:.3f}); held-out recall {best['test']['recall']:.3f}")
         artifact[key] = {"pipeline": build_classifier(best["kind"]).fit(X, y),
                          "threshold": float(best["threshold"]), "model_name": best["kind"]}
@@ -285,7 +311,7 @@ def main():
     if DAMAGE_TARGET in df.columns:
         yd = df[DAMAGE_TARGET].astype(float)
         dres = [evaluate_regressor(k, X.iloc[tr], yd.iloc[tr], g_tr, X.iloc[te], yd.iloc[te]) for k in REG_NAMES]
-        dbest = min(dres, key=lambda r: r["cv"]["mae"])
+        dbest = choose(dres, lambda r: r["cv"]["mae"], False, args.tree_margin)
         print(f"  -> best: {dbest['kind']} (test MAE {dbest['test']['mae']:.3f}, R2 {dbest['test']['r2']:.3f})")
         artifact["damage"] = {"pipeline": build_regressor(dbest["kind"]).fit(X, yd), "model_name": dbest["kind"]}
         dmg = (dres, dbest["kind"])

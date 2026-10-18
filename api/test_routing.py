@@ -168,6 +168,20 @@ def test_contract_evacuation_prefers_leaving_the_risk_zone():
     assert name == "Outside"
 
 
+def test_contract_evacuation_from_inside_a_hazard_zone_can_leave_it():
+    origin = (18.45, -33.95)                                   # centre of the fire zone
+    zone = nodes_in_zones(M, [{"lon": 18.45, "lat": -33.95, "radius_m": 2500, "hazard": "fire"}])
+    assert nearest_node(M, *origin) in zone                    # we really start inside the zone
+    side_closure = nodes_in_zones(M, [{"lon": 18.40, "lat": -33.98, "radius_m": 400, "hazard": "flood"}])
+    out_node = nearest_node(M, 18.40, -33.99)
+    assert side_closure and out_node not in side_closure and not (side_closure & zone)
+    name, path = evacuation_route(M, origin, [{"name": "Out", "lon": 18.40, "lat": -33.99}],
+                                  zone | side_closure)
+    assert name == "Out" and path
+    assert path[-1] == out_node and path[-1] not in zone       # it gets out and ends outside the zone
+    assert not (set(path) & side_closure)                      # the separate closure is still avoided
+
+
 def test_nodes_to_lonlat_gives_lon_lat_pairs():
     route = safe_route(M, M_START, M_END, [])
     pts = nodes_to_lonlat(M, route)
