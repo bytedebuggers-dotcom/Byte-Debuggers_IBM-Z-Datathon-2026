@@ -1,169 +1,119 @@
-import csv
-import io
-import json
-import os
-from datetime import datetime, timezone
-from typing import List, Literal, Optional
- 
-import joblib
-import pandas as pd
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse, Response
+# api/main.py
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
- 
-app = FastAPI(title="QuakeFix API")
- 
-class Event(BaseModel):
-    id: str
-    magnitude: float
-    depth_km: float
-    lat: float
-    lon: float
- 
-class Directive(BaseModel):
-    id: str
-    priority: int
-    hazard: str
-    action: str
-    risk: Optional[float] = None
-    confidence: Optional[float] = None
-    route_nodes: Optional[List[int]] = None
-    status: Literal["pending", "approved", "overridden"] = "pending"
- 
-class Zone(BaseModel):
-    id: str
-    hazard: str
-    lat: float
-    lon: float
-    radius_m: float
-    risk: float
- 
-class Route(BaseModel):
-    id: str
-    kind: Literal["ambulance", "evacuation"]
-    label: str
-    path: List[List[float]]
- 
-class QuakeState(BaseModel):
-    event: Event
-    directives: List[Directive]
-    zones: List[Zone]
-    routes: List[Route]
- 
-class Decision(BaseModel):
-    decision: Literal["approve", "override"]
-    note: str = ""
- 
-class SegmentFeatures(BaseModel):
-    magnitude: float
-    dist_km: float
-    shaking: float
-    pipe_age: float
-    sensor_var: float
-    gas_main_dist_m: float
-    elevation_m: float
-    building_age: float
- 
-# --- SAN FRANCISCO DEMO CITY (Fixed from 0.0 placeholder) ---
-STATE = QuakeState(
-    event=Event(id="sf-demo-1", magnitude=6.7, depth_km=10.0, lat=37.7749, lon=-122.4194),
-    directives=[
-        Directive(id="D-001", priority=1, hazard="gas_leak", action="Isolate Valve Sector 4 - Mission District",
-                  risk=0.87, confidence=0.74),
-        Directive(id="D-002", priority=2, hazard="fire", action="Dispatch fire unit to Zone F2 - SOMA",
-                  risk=0.71, confidence=0.66),
-        Directive(id="D-003", priority=3, hazard="flood", action="Close underpass at Route 7",
-                  risk=0.64, confidence=0.61),
-        Directive(id="D-004", priority=4, hazard="road_blocked",
-                  action="Reroute Ambulance Unit 2 via Route B", route_nodes=[101, 205, 318]),
-        Directive(id="D-005", priority=5, hazard="evacuation",
-                  action="Evacuate District 3 to Assembly Point A - Embarcadero"),
-    ],
-    zones=[
-        Zone(id="Z-1", hazard="fire", lat=37.7849, lon=-122.4094, radius_m=600, risk=0.71),
-        Zone(id="Z-2", hazard="flood", lat=37.8049, lon=-122.4294, radius_m=800, risk=0.64),
-        Zone(id="Z-3", hazard="gas_leak", lat=37.7749, lon=-122.4194, radius_m=400, risk=0.87),
-    ],
-    routes=[
-        Route(id="R-1", kind="ambulance", label="Ambulance Unit 2 via Route B",
-              path=[[-122.4194, 37.7749], [-122.4094, 37.7849], [-122.4000, 37.7949]]),
-        Route(id="R-2", kind="evacuation", label="District 3 to Assembly Point A",
-              path=[[-122.4194, 37.7749], [-122.4294, 37.7649], [-122.4394, 37.7549]]),
-    ],
+import joblib
+import os
+import numpy as np
+
+# Import your routing contract functions
+from api.routing import get_graph, nodes_in_zones, safe_route_emergency, safe_route_evacuation, nodes_to_lonlat
+
+app = FastAPI(title="QuakeFix API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
- 
-AUDIT_LOG: list = []
-os.makedirs("logs", exist_ok=True)
-MODEL_PATH = os.getenv("MODEL_PATH", "models/model.joblib")
-try:
-    ART = joblib.load(MODEL_PATH)
-    for h in ["burst", "fire", "flood"]:
-        if h in ART and "pipeline" in ART[h]:
-            for _, step in ART[h]["pipeline"].steps:
-                if type(step).__name__ == "LogisticRegression":
-                    if not hasattr(step, "multi_class"):
-                        step.multi_class = "auto"
-except Exception:
-    ART = None
- 
+
+# Global storage for graph and model
+model_data = None
+road_graph = None
+
+@app.on_event("startup")
+def startup_load():
+    global model_data, road_graph
+    
+    # 1. Load ML Model pipeline
+    model_path = os.getenv("QUAKEFIX_MODEL", "models/model.joblib")
+    if os.path.exists(model_path):
+        model_data = joblib.load(model_path)
+        
+    # 2. Load Road Graph via your routing module
+    try:
+        road_graph = get_graph()
+    except Exception:
+        road_graph = None
+
 @app.get("/health")
-def health():
-    return {"status": "ok", "model_loaded": ART is not None, "city": "San Francisco", "lat": 37.7749, "lon": -122.4194}
- 
-@app.get("/events/latest", response_model=QuakeState)
-def latest():
-    return STATE
- 
-@app.get("/hazards/zones", response_model=List[Zone])
-def zones():
-    return STATE.zones
- 
-@app.get("/routes", response_model=List[Route])
-def routes():
-    return STATE.routes
- 
-@app.post("/directives/generate", response_model=QuakeState)
-def generate():
-    return STATE
- 
-@app.post("/directives/{directive_id}/decision", response_model=Directive)
-def decide(directive_id: str, body: Decision):
-    for d in STATE.directives:
-        if d.id == directive_id:
-            d.status = "approved" if body.decision == "approve" else "overridden"
-            entry = {"time": datetime.now(timezone.utc).isoformat(), "directive": d.id,
-                     "decision": body.decision, "note": body.note}
-            AUDIT_LOG.append(entry)
-            with open("logs/audit.jsonl", "a") as f:
-                f.write(json.dumps(entry) + "\n")
-            return d
-    raise HTTPException(status_code=404, detail="Directive not found")
- 
-@app.get("/export/sms", response_class=PlainTextResponse)
+def health_check():
+    return {
+        "status": "ok", 
+        "model_loaded": model_data is not None,
+        "graph_loaded": road_graph is not None
+    }
+
+class RouteRequest(BaseModel):
+    origin_lonlat: list[float]
+    dest_lonlat: list[float]
+    hazard_zones: list[dict] = []
+
+@app.post("/routes/safe-emergency")
+def calculate_emergency_route(payload: RouteRequest):
+    if road_graph is None:
+        raise HTTPException(status_code=503, detail="Road graph not initialized.")
+    
+    blocked = nodes_in_zones(road_graph, payload.hazard_zones)
+    
+    result = safe_route_emergency(
+        origin_lonlat=payload.origin_lonlat,
+        dest_lonlat=payload.dest_lonlat,
+        hazard_nodes=blocked,
+        G=road_graph
+    )
+    return result
+
+@app.get("/events/latest")
+def get_latest_event():
+    if road_graph is None:
+        raise HTTPException(status_code=503, detail="Road graph not initialized.")
+    
+    return {
+        "event": {"id": "sf-demo-1", "magnitude": 6.7, "depth_km": 10.0, "lat": 37.7749, "lon": -122.4194},
+        "directives": [
+            {"id": "D-001", "priority": 1, "hazard": "gas_leak", "action": "Isolate Valve Sector 4", "risk": 0.87, "confidence": 0.74, "status": "pending"},
+            {"id": "D-002", "priority": 2, "hazard": "fire", "action": "Dispatch fire unit to Zone F2", "risk": 0.71, "confidence": 0.66, "status": "pending"}
+        ],
+        "zones": [
+            {"id": "Z-1", "hazard": "fire", "lat": 37.7849, "lon": -122.4094, "radius_m": 600, "risk": 0.71}
+        ],
+        "routes": [
+            {"id": "R-1", "kind": "ambulance", "label": "Ambulance Unit 2", "path": [[-122.4194, 37.7749], [-122.4094, 37.8191]]}
+        ]
+    }
+
+class PredictRequest(BaseModel):
+    features: list[float]
+
+@app.post("/predict")
+def predict_hazard_risk(payload: PredictRequest):
+    if model_data is None:
+        raise HTTPException(status_code=503, detail="ML model pipeline (model.joblib) not loaded.")
+    
+    if len(payload.features) != 8:
+        raise HTTPException(status_code=400, detail="Expected exactly 8 feature values.")
+    
+    X = np.array([payload.features])
+    
+    burst_prob = float(model_data["burst"]["pipeline"].predict_proba(X)[0][1])
+    fire_prob = float(model_data["fire"]["pipeline"].predict_proba(X)[0][1])
+    flood_prob = float(model_data["flood"]["pipeline"].predict_proba(X)[0][1])
+    damage_score = float(model_data["damage"]["pipeline"].predict(X)[0])
+    
+    return {
+        "burst_risk": burst_prob,
+        "fire_risk": fire_prob,
+        "flood_risk": flood_prob,
+        "damage_score": damage_score
+    }
+
+@app.get("/export/sms")
 def export_sms():
-    e = STATE.event
-    parts = [f"QUAKEFIX M{e.magnitude} SF"]
-    parts += [f"{d.id} P{d.priority} {d.hazard.upper()}: {d.action} [{d.status}]"
-              for d in STATE.directives]
-    return " | ".join(parts)
- 
+    return "EMERGENCY: QuakeFix Alert. Sector 4 Gas Leak Isolated. Evacuate District 3 immediately."
+
 @app.get("/export/csv")
 def export_csv():
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", "priority", "hazard", "action", "risk", "confidence", "status"])
-    for d in STATE.directives:
-        w.writerow([d.id, d.priority, d.hazard, d.action, d.risk, d.confidence, d.status])
-    return Response(content=buf.getvalue(), media_type="text/csv")
- 
-@app.post("/predict")
-def predict(f: SegmentFeatures):
-    if ART is None:
-        raise HTTPException(status_code=503, detail="Model not loaded - use dummy until Member 3 delivers")
-    X = pd.DataFrame([f.model_dump()])[ART["features"]]
-    out = {}
-    for h in ["burst", "fire", "flood"]:
-        p = float(ART[h]["pipeline"].predict_proba(X)[0, 1])
-        out[h] = {"risk": p, "flag": p >= ART[h]["threshold"], "threshold": ART[h]["threshold"]}
-    out["damage"] = {"score": float(ART["damage"]["pipeline"].predict(X)[0])}
-    return out
+    return "directive_id,hazard,action,priority,status\nD-001,gas_leak,Isolate Valve Sector 4,1,pending\nD-002,fire,Dispatch fire unit to Zone F2,2,pending"
