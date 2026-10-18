@@ -1,0 +1,15 @@
+[theme]
+# Primary accent color (Deep Emergency Blue)
+primaryColor = "#0B2A6B"
+
+# Main background color for the dashboard
+backgroundColor = "#FFFFFF"
+
+# Secondary background for sidebars, cards, and widgets
+secondaryBackgroundColor = "#F4F6F9"
+
+# Main text color optimized for high readability
+textColor = "#111827"
+
+# Font family style
+font = "sans serif"
